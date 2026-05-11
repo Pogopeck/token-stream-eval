@@ -1,0 +1,363 @@
+
+
+===== FILE: ./README.md =====
+
+
+
+===== FILE: ./app/main.py =====
+
+import warnings; warnings.filterwarnings("ignore")
+import json
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from app.graph import graph_app
+from pydantic import BaseModel
+from fastapi import BackgroundTasks
+from app.modules.evaluator import get_ragas_metrics
+
+app = FastAPI(title="GuardianRAG API")
+
+class QueryRequest(BaseModel):
+    question: str
+
+@app.post("/stream")
+async def stream_rag(request: QueryRequest, background_tasks: BackgroundTasks):
+    # This is the generator
+    async def event_generator():
+        initial_state = {
+            "question": request.question,
+            "retry_count": 0,
+            "logs": [],
+            "context": "",
+            "answer": "",
+            "is_hallucinated": False,
+            "total_tokens": 0,
+            "total_cost": 0.0
+        }
+        
+        async for output in graph_app.astream(initial_state):
+            yield f"data: {json.dumps(output)}\n\n"
+            
+            # ASYNC SHADOW EVALUATION
+            if "generate" in output:
+                # This runs after the user has already received the answer
+                background_tasks.add_task(get_ragas_metrics, output["generate"])
+        # Do NOT return a value here. Just let it finish or use a bare return. 
+
+    # Return the response CALLING the generator
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+===== FILE: ./app/schemas.py =====
+
+from pydantic import BaseModel, Field
+from typing import List, Optional, TypedDict, Literal
+
+# The 'Judge' output
+class HallucinationCheck(BaseModel):
+    is_hallucinated: bool = Field(description="True if the answer contains facts not in the context.")
+    reasoning: str = Field(description="Explanation of why it is or isn't hallucinated.")
+    confidence: float = Field(description="Confidence score between 0 and 1.")
+
+# The State object that moves through LangGraph
+class AgentState(TypedDict):
+    question: str
+    category: str
+    context: str
+    answer: str
+    is_hallucinated: bool
+    retry_count: int
+    logs: List[str]
+    total_tokens: int
+    total_cost: float
+    faithfulness_score: float
+    cache_hit: bool
+    stream_id: str
+
+===== FILE: ./app/modules/evaluator.py =====
+
+import os
+from dotenv import load_dotenv
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import faithfulness
+from langchain_google_genai import ChatGoogleGenerativeAI
+from ragas.llms import LangchainLLMWrapper
+from app.schemas import HallucinationCheck
+
+load_dotenv()
+
+# 1. Setup the Gemini model
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash", 
+    google_api_key=os.getenv("GOOGLE_API_KEY"),
+    max_retries=6, # Automatically retry 6 times
+    timeout=60
+)
+
+# 2. Wrap Gemini for RAGAS (Prevents the OpenAI Error)
+ragas_judge = LangchainLLMWrapper(llm)
+
+# 3. The Boolean Judge (For Graph Logic)
+judge_llm_structured = llm.with_structured_output(HallucinationCheck)
+
+def check_hallucination(context: str, answer: str) -> HallucinationCheck:
+    prompt = f"CONTEXT: {context}\nANSWER: {answer}\nCheck for hallucinations."
+    return judge_llm_structured.invoke(prompt)
+
+# 4. The RAGAS Scorer (For Monitoring)
+def get_ragas_metrics(state):
+    try:
+        data = {
+            "question": [state["question"]],
+            "contexts": [[state["context"]]],
+            "answer": [state["answer"]]
+        }
+        dataset = Dataset.from_dict(data)
+        
+        # Explicitly pass Gemini to RAGAS
+        results = evaluate(
+            dataset, 
+            metrics=[faithfulness], 
+            llm=ragas_judge
+        )
+        return float(results["faithfulness"])
+    except Exception as e:
+        print(f"Ragas Error: {e}")
+        return 0.0
+
+===== FILE: ./app/modules/retriever.py =====
+
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper
+from dotenv import load_dotenv
+from functools import lru_cache
+
+load_dotenv()
+
+@lru_cache(maxsize=100) # This stores the last 100 Wikipedia searches in RAM
+def get_trusted_context(query: str) -> str:
+    # Your Wikipedia logic here...
+    return wiki.run(query)
+
+def get_trusted_context(query: str) -> str:
+    """Fetches real-time data from Wikipedia."""
+    api_wrapper = WikipediaAPIWrapper(top_k_results=2, doc_content_chars_max=1000)
+    wiki = WikipediaQueryRun(api_wrapper=api_wrapper)
+    try:
+        return wiki.run(query)
+    except Exception as e:
+        return f"Error fetching context: {str(e)}"
+
+===== FILE: ./app/modules/router.py =====
+
+# app/modules/router.py
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+class RouteQuery(BaseModel):
+    category: Literal["greeting", "rag_required", "off_topic"] = Field(
+        description="The category of the user query."
+    )
+
+async def semantic_router(query: str):
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", max_retries=6, # Automatically retry 6 times
+    timeout=60)
+    structured_llm = llm.with_structured_output(RouteQuery)
+    
+    prompt = f"Categorize this user query for a RAG system: {query}"
+    # Use ainvoke for production async support
+    result = await structured_llm.ainvoke(prompt)
+    return result.category
+
+===== FILE: ./app/modules/cache.py =====
+
+import chromadb
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import os
+
+# Initialize ChromaDB (local storage)
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection(name="semantic_cache")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+
+async def get_semantic_cache(question: str):
+    try:
+        query_vector = embeddings.embed_query(question)
+        results = collection.query(query_embeddings=[query_vector], n_results=1)
+        if results['distances'] and results['distances'][0][0] < 0.1:
+            return results['documents'][0][0]
+    except Exception as e:
+        # If the cache fails, we just return None and let the RAG continue
+        # This is 'Graceful Degradation'
+        print(f"Cache lookup failed: {e}")
+    return None
+    # Convert question to vector
+    query_vector = embeddings.embed_query(question)
+    
+    # Search for similar questions
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=1
+    )
+    
+    # If the similarity is very high (distance is low), return the cached answer
+    if results['distances'] and results['distances'][0][0] < 0.1:
+        return results['documents'][0][0]
+    return None
+
+def save_to_cache(question: str, answer: str):
+    query_vector = embeddings.embed_query(question)
+    collection.add(
+        embeddings=[query_vector],
+        documents=[answer],
+        ids=[question]
+    )
+
+===== FILE: ./app/modules/generator.py =====
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+INPUT_PRICE_PER_1M = 0.30 
+OUTPUT_PRICE_PER_1M = 1.25
+
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GOOGLE_API_KEY"), max_retries=6, # Automatically retry 6 times
+    timeout=60, streaming=True)
+
+async def generate_rag_answer(question: str, context: str) -> str:
+    system_prompt = (
+        "You are a helpful assistant. Answer the question based ONLY on the provided context. "
+        "If the answer is not in the context, say you don't know."
+    )
+    user_prompt = f"Context: {context}\n\nQuestion: {question}"
+    
+    response = await llm.ainvoke([
+        ("system", system_prompt),
+        ("human", f"Context: {context}\n\nQuestion: {question}")
+    ])
+    # LEVEL 2: PROGRAMMATIC TRACKING
+    usage = response.usage_metadata
+    in_t = usage.get("input_tokens", 0)
+    out_t = usage.get("output_tokens", 0)
+    
+    cost = ((in_t * INPUT_PRICE_PER_1M) + (out_t * OUTPUT_PRICE_PER_1M)) / 1_000_000
+    return response.content, in_t + out_t, cost
+
+===== FILE: ./app/graph.py =====
+
+from langgraph.graph import StateGraph, END
+from app.schemas import AgentState
+from app.modules.retriever import get_trusted_context
+from app.modules.generator import generate_rag_answer
+from app.modules.evaluator import check_hallucination
+from app.modules.evaluator import get_ragas_metrics
+from app.modules.router import semantic_router
+from app.modules.cache import get_semantic_cache, save_to_cache
+
+async def route_node(state: AgentState):
+    # This calls the Gemini-powered router we built
+    category = await semantic_router(state["question"])
+    return {"category": category, "logs": state["logs"] + [f"Routed to: {category}"]}
+
+# Conditional Logic
+def decide_path(state: AgentState):
+    if state["category"] == "greeting":
+        return "greeting_path"
+    if state["category"] == "off_topic":
+        return "reject"
+    return "rag_path"    
+
+# Node 1: Retrieve
+async def retrieve_node(state: AgentState):
+    context = get_trusted_context(state["question"])
+    return {"context": "Retrieved info...", "retry_count": state["retry_count"] + 1}
+
+# Node 2: Generate
+async def generate_node(state: AgentState):
+    # Check Semantic Cache first
+    cached_response = await get_semantic_cache(state["question"])
+    if cached_response:
+        return {"answer": cached_response, "logs": state["logs"] + ["Semantic Cache Hit!"]}
+    # 2. Call Generator and Unpack results
+    result = await generate_rag_answer(state["question"], state["context"])
+    # Ensure 'ans' matches what you pass to save_to_cache
+    ans, tokens, cost = await generate_rag_answer(state["question"], state["context"])
+    
+    # 3. Save to Cache for future users
+    save_to_cache(state["question"], ans)
+    
+    return {
+        "answer": ans,
+        "total_tokens": state.get("total_tokens", 0) + tokens,
+        "total_cost": state.get("total_cost", 0.0) + cost
+    }
+
+# Node 3: Evaluate
+def evaluate_node(state: AgentState):
+    f_score = get_ragas_metrics(state)
+    eval_result = check_hallucination(state["context"], state["answer"])
+    return {
+        "faithfulness_score": f_score,
+        "is_hallucinated": eval_result.is_hallucinated,
+        "logs": state["logs"] + [f"Evaluation: {eval_result.reasoning}"]
+    }
+
+# Logic for branching
+def decide_next_step(state: AgentState):
+    if state["is_hallucinated"] and state["retry_count"] < 1:
+        return "retry"
+    return "end"
+
+# Build Graph
+workflow = StateGraph(AgentState)
+workflow.add_node("router", route_node)
+workflow.add_node("retrieve", retrieve_node)
+workflow.add_node("generate", generate_node)
+
+workflow.set_entry_point("router")
+workflow.add_conditional_edges("router", decide_path, {
+    "greeting_path": "generate",
+    "rag_path": "retrieve"
+})
+workflow.add_edge("retrieve", "generate")
+workflow.add_node("evaluate", evaluate_node)
+
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "generate")
+workflow.add_edge("generate", "evaluate")
+
+workflow.add_conditional_edges(
+    "evaluate",
+    decide_next_step,
+    {"retry": "generate", "end": END}
+)
+
+graph_app = workflow.compile()
+
+===== FILE: ./app/list_models.py =====
+
+import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+print("Available Models supporting 'embedContent':")
+for m in genai.list_models():
+    if 'embedContent' in m.supported_generation_methods:
+        print(f" - {m.name}")
+
+print("\nAvailable Models supporting 'generateContent':")
+for m in genai.list_models():
+    if 'generateContent' in m.supported_generation_methods:
+        print(f" - {m.name}")
